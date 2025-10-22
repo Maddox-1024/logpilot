@@ -6,7 +6,7 @@
 *.dylib
 bin/*
 Dockerfile.cross
-config/samples
+config/samples/log_v1_logpilot.yaml
 # Test binary, built with `go test -c`
 *.test
 
