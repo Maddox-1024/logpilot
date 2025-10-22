@@ -1,14 +1,1 @@
-apiVersion: log.aiops.com/v1
-kind: LogPilot
-metadata:
-  labels:
-    app.kubernetes.io/name: logpilot
-    app.kubernetes.io/managed-by: kustomize
-  namespace: logpilot-system
-  name: logpilot-sample
-spec:
-  lokiURL: "http://loki-skyway-america-pre.loki:3100"
-  logQL: '{component="jobmanager"} |= `Exception:` |~ "\n"'
-  llmModel: "gemini-2.5-flash"
-  llmToken: "AIzaSyCyDrwS-CD4rhC-OL1-hexy0gb3Xs2x8Ac"
-  larkWebhook: "https://open.feishu.cn/open-apis/bot/v2/hook/c45a25ad-8820-498a-9333-bbf859756fd2"
+
