@@ -22,20 +22,43 @@ import (
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+type ModelProvider string
+
+const (
+	ModelProviderOpenAI ModelProvider = "OpenAI"
+	ModelProviderGemini ModelProvider = "Gemini"
+)
+
+type OpenAIConfig struct {
+	// Base URL for the OpenAI API
+	// +optional
+	BaseURL string `json:"baseURL,omitempty"`
+}
+
+type GeminiConfig struct{}
 
 // LogPilotSpec defines the desired state of LogPilot.
 type LogPilotSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-
 	// Loki URL
 	LokiURL string `json:"lokiURL,omitempty"`
 	// Loki LogQL
 	LogQL string `json:"logQL,omitempty"`
+	// Interval
+	Interval string `json:"interval,omitempty"`
+	// Model Provider
+	LLMProvider ModelProvider `json:"llmProvider,omitempty"`
 	// LLM Model
 	LLMModel string `json:"llmModel,omitempty"`
-	// LLM Token
-	LLMToken string `json:"llmToken,omitempty"`
+	// LLM API Key Secret
+	LLMAPIKeySecret string `json:"llmAPIKeySecret,omitempty"`
+	// LLM API Key Secret Key
+	LLMAPIKeySecretKey string `json:"llmAPIKeySecretKey,omitempty"`
+	// OpenAI Config
+	OpenAI *OpenAIConfig `json:"openAI,omitempty"`
+	// Gemini Config
+	Gemini *GeminiConfig `json:"gemini,omitempty"`
 	// Feishu Webhook
 	LarkWebhook string `json:"larkWebhook,omitempty"`
 }
@@ -44,8 +67,9 @@ type LogPilotSpec struct {
 type LogPilotStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	// PreTimeStamp
-	PreTimeStamp string `json:"preTimeStamp,omitempty"`
+	LastCheckTime metav1.Time `json:"lastCheckTime,omitempty"`
+	LastAnalysis  string      `json:"lastAnalysis,omitempty"`
+	LastError     string      `json:"lastError,omitempty"`
 }
 
 // +kubebuilder:object:root=true

@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: registry.cn-shenzhen.aliyuncs.com/ai-pilot/logpilot
-  newTag: v0.1.5
+  newTag: v0.2.0

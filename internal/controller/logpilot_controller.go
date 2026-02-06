@@ -24,12 +24,15 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/generative-ai-go/genai"
-	"google.golang.org/api/option"
+	openai "github.com/openai/openai-go"
+	openAIOption "github.com/openai/openai-go/option"
+	googleOption "google.golang.org/api/option"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -66,66 +69,65 @@ func (r *LogPilotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Calculate the time range for the query
-	currentTime := time.Now().Unix()
-	preTimeStamp := logPilot.Status.PreTimeStamp
-	// print preTimeStamp for debugging
-	fmt.Printf("preTimeStamp: %s\n", preTimeStamp)
+	interval, err := time.ParseDuration(logPilot.Spec.Interval)
+	if err != nil {
+		logger.Error(err, "unable to parse interval", "interval", logPilot.Spec.Interval)
+		// Use default interval of 10 seconds if parsing fails
+		interval = time.Minute
+	}
 
-	var preTime int64
-	if preTimeStamp == "" {
-		preTime = currentTime - 5
-	} else {
-		preTime, _ = strconv.ParseInt(preTimeStamp, 10, 64)
+	lastTime := logPilot.Status.LastCheckTime.Time
+	if !lastTime.IsZero() && time.Since(lastTime) < interval {
+		return ctrl.Result{RequeueAfter: interval - time.Since(lastTime)}, nil
+	}
+
+	apiKey, err := r.getSecretValue(ctx, req.Namespace, logPilot.Spec.LLMAPIKeySecret, logPilot.Spec.LLMAPIKeySecretKey)
+	if err != nil {
+		logger.Error(err, "unable to get LLM API key from secret")
+		r.updateStatus(ctx, &logPilot, "", fmt.Sprintf("Secret error: %v", err))
+		return ctrl.Result{RequeueAfter: interval}, nil
 	}
 	// Loki query
 	lokiQuery := logPilot.Spec.LogQL
-	endTime := currentTime * 1000000000     // Current time in nanoseconds
-	startTime := (preTime - 5) * 1000000000 // Previous timestamp
+	endTime := time.Now().UnixNano()
+	startTime := time.Now().Add(-interval).UnixNano()
 	fmt.Printf("startTime: %d, endTime: %d\n", startTime, endTime)
 
-	if startTime >= endTime {
-		logger.Info("startTime >= endTime")
-		// print startTime and endTime for debugging
-		return ctrl.Result{RequeueAfter: time.Second * 10}, nil
-	}
-
-	startTimeForUpdate := currentTime
 	lokiURL := fmt.Sprintf("%s/loki/api/v1/query_range?query=%s&start=%d&end=%d", logPilot.Spec.LokiURL, url.QueryEscape(lokiQuery), startTime, endTime)
 	fmt.Printf("lokiURL: %s\n", lokiURL)
 	lokiLogs, err := r.queryLoki(lokiURL)
 	fmt.Println(lokiLogs)
 	if err != nil {
-		// logger.Error(err, "unable to query Loki")
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		logger.Error(err, "unable to query Loki")
+		r.updateStatus(ctx, &logPilot, "", fmt.Sprintf("Loki error: %v", err))
+		return ctrl.Result{RequeueAfter: interval}, nil
 	}
 
 	// If there are log results, call LLM for analysis
 	if lokiLogs != "" {
 		fmt.Println("send log to llm")
-		analysisResult, err := r.analyzeLogsWithLLM(logPilot.Spec.LLMToken, logPilot.Spec.LLMModel, lokiLogs)
+		analysisResult, err := r.analyzeLogsWithLLM(logPilot.Spec, apiKey, lokiLogs)
 		if err != nil {
 			logger.Error(err, "unable to analyze logs with LLM")
-			return ctrl.Result{}, err
 		}
 		// If the LLM result indicates there is a problem with the logs, send Feishu alert
 		if analysisResult.HasError {
 			err := r.sendLarkAlert(logPilot.Spec.LarkWebhook, analysisResult.Analysis)
 			if err != nil {
-				logger.Error(err, "unable to send lark alert")
-				return ctrl.Result{}, err
+				logger.Error(err, "Failed to send lark alert")
 			}
+		} else {
+			logger.Info("No issues found in logs according to LLM analysis")
 		}
-	}
-	// Update PreTimeStamp in status
-	logPilot.Status.PreTimeStamp = fmt.Sprintf("%d", startTimeForUpdate)
-	if err := r.Status().Update(ctx, &logPilot); err != nil {
-		logger.Error(err, "unable to update logPilot status")
-		return ctrl.Result{}, err
+		// Update status with analysis result
+		r.updateStatus(ctx, &logPilot, analysisResult.Analysis, "")
+		return ctrl.Result{RequeueAfter: interval}, nil
+	} else {
+		r.updateStatus(ctx, &logPilot, "No logs found", "")
 	}
 
 	// Reconcile again after 10 seconds
-	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	return ctrl.Result{RequeueAfter: interval}, nil
 }
 
 // queryLoki retrieves logs from Loki
@@ -165,29 +167,84 @@ type LLMAnalysisResult struct {
 	Analysis string // Analysis results returned by LLM
 }
 
+func (r *LogPilotReconciler) getSecretValue(ctx context.Context, namespace, name, key string) (string, error) {
+	var secret corev1.Secret
+	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &secret); err != nil {
+		return "", err
+	}
+
+	value, exists := secret.Data[key]
+	if !exists {
+		return "", fmt.Errorf("key %s not found in secret %s", key, name)
+	}
+	return string(value), nil
+}
+
+const systemPrompt = `你是一名经验丰富的日志分析专家和系统优化顾问。以下日志是从日志系统里获取到的日志。你的任务是：给出环境（根据namespace标签确定是哪个环境）,给出服务（根据app标签确定是哪个服务），分析日志内容，总结关键信息，提出可能的原因，给出简短的建议。如果遇到严重问题，例如外部系统请求失败、系统故障、致命错误、数据库连接异常等严重问题时，在内容里返回[lark]标识`
+
 // analyzeLogsWithLLM calls the LLM interface to analyze logs
-func (r *LogPilotReconciler) analyzeLogsWithLLM(token, model, logs string) (*LLMAnalysisResult, error) {
+func (r *LogPilotReconciler) analyzeLogsWithLLM(spec logv1.LogPilotSpec, token, logs string) (*LLMAnalysisResult, error) {
+	switch spec.LLMProvider {
+	case "OpenAI":
+		return callOpenAI(spec, token, logs)
+	case "Gemini":
+		return callGemini(spec, token, logs)
+	default:
+		return nil, fmt.Errorf("unsupported LLM provider: %s", spec.LLMProvider)
+	}
+}
+
+func callOpenAI(spec logv1.LogPilotSpec, token, logs string) (*LLMAnalysisResult, error) {
+	// 1. 配置 Client 选项
+	opts := []openAIOption.RequestOption{
+		openAIOption.WithAPIKey(token),
+	}
+	if spec.OpenAI.BaseURL != "" {
+		opts = append(opts, openAIOption.WithBaseURL(spec.OpenAI.BaseURL))
+	}
+
+	// 2. 初始化 Client
+	client := openai.NewClient(opts...)
+
+	// 4. 发起调用
+	completion, err := client.Chat.Completions.New(context.TODO(), openai.ChatCompletionNewParams{
+		Model: spec.LLMModel,
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			openai.DeveloperMessage(systemPrompt),
+			openai.UserMessage(logs),
+		},
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("openai api error: %w", err)
+	}
+
+	if len(completion.Choices) == 0 {
+		return nil, fmt.Errorf("no choices returned")
+	}
+
+	// 5. 解析结果
+	analysis := completion.Choices[0].Message.Content
+
+	return parseLLMResponse(analysis), nil
+}
+
+func callGemini(spec logv1.LogPilotSpec, token, logs string) (*LLMAnalysisResult, error) {
 	ctx := context.Background()
-	client, err := genai.NewClient(ctx, option.WithAPIKey(token))
+	client, err := genai.NewClient(ctx, googleOption.WithAPIKey(token))
 	if err != nil {
 		return nil, err
 	}
 	defer client.Close()
 
-	modelClient := client.GenerativeModel(model)
-	prompt := genai.Text(fmt.Sprintf("你是一名经验丰富的日志分析专家和系统优化顾问。以下日志是从日志系统里获取到的日志。你的任务是：给出环境（根据namespace标签确定是哪个环境）,给出服务（根据app标签确定是哪个服务），分析日志内容，总结关键信息，提出可能的原因，给出简短的建议。如果遇到严重问题，例如外部系统请求失败、系统故障、致命错误、数据库连接异常等严重问题时，在内容里返回[lark]标识\n%s", logs))
+	modelClient := client.GenerativeModel(spec.LLMModel)
+	prompt := genai.Text(fmt.Sprintf("%s\n%s", systemPrompt, logs))
 
 	resp, err := modelClient.GenerateContent(ctx, prompt)
 	if err != nil {
 		fmt.Printf("ChatCompletion error: %v\n", err)
 		return nil, err
 	}
-
-	return r.parseLLMResponse(resp), nil
-}
-
-// parseLLMResponse parses the response from the LLM API
-func (r *LogPilotReconciler) parseLLMResponse(resp *genai.GenerateContentResponse) *LLMAnalysisResult {
 	var analysis string
 	if resp != nil {
 		for _, cand := range resp.Candidates {
@@ -201,8 +258,14 @@ func (r *LogPilotReconciler) parseLLMResponse(resp *genai.GenerateContentRespons
 		}
 	}
 
+	return parseLLMResponse(analysis), nil
+}
+
+// parseLLMResponse parses the response from the LLM API
+func parseLLMResponse(resp string) *LLMAnalysisResult {
+
 	result := &LLMAnalysisResult{
-		Analysis: analysis, // Get analysis results from text returned by LLM
+		Analysis: resp, // Get analysis results from text returned by LLM
 	}
 
 	// Simple judgment whether the analysis result contains error identifiers
@@ -244,6 +307,13 @@ func (r *LogPilotReconciler) sendLarkAlert(webhook, analysis string) error {
 		return fmt.Errorf("status code: %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func (r *LogPilotReconciler) updateStatus(ctx context.Context, logPilot *logv1.LogPilot, analysis, errMsg string) {
+	logPilot.Status.LastCheckTime = metav1.Now()
+	logPilot.Status.LastAnalysis = analysis
+	logPilot.Status.LastError = errMsg
+	r.Status().Update(ctx, logPilot)
 }
 
 // SetupWithManager sets up the controller with the Manager.

@@ -39,30 +39,56 @@ spec:
           spec:
             description: LogPilotSpec defines the desired state of LogPilot.
             properties:
+              gemini:
+                description: Gemini Config
+                type: object
+              interval:
+                description: Interval
+                type: string
               larkWebhook:
                 description: Feishu Webhook
+                type: string
+              llmAPIKeySecret:
+                description: LLM API Key Secret
+                type: string
+              llmAPIKeySecretKey:
+                description: LLM API Key Secret Key
                 type: string
               llmModel:
                 description: LLM Model
                 type: string
-              llmToken:
-                description: LLM Token
+              llmProvider:
+                description: Model Provider
                 type: string
               logQL:
                 description: Loki LogQL
                 type: string
               lokiURL:
-                description: Loki URL
+                description: |-
+                  INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
+                  Important: Run "make" to regenerate code after modifying this file
+                  Loki URL
                 type: string
+              openAI:
+                description: OpenAI Config
+                properties:
+                  baseURL:
+                    description: Base URL for the OpenAI API
+                    type: string
+                type: object
             type: object
           status:
             description: LogPilotStatus defines the observed state of LogPilot.
             properties:
-              preTimeStamp:
+              lastAnalysis:
+                type: string
+              lastCheckTime:
                 description: |-
                   INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
                   Important: Run "make" to regenerate code after modifying this file
-                  PreTimeStamp
+                format: date-time
+                type: string
+              lastError:
                 type: string
             type: object
         type: object
