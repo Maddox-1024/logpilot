@@ -210,7 +210,7 @@ func callOpenAI(spec logv1.LogPilotSpec, token, logs string) (*LLMAnalysisResult
 	completion, err := client.Chat.Completions.New(context.TODO(), openai.ChatCompletionNewParams{
 		Model: spec.LLMModel,
 		Messages: []openai.ChatCompletionMessageParamUnion{
-			openai.DeveloperMessage(systemPrompt),
+			openai.SystemMessage(systemPrompt),
 			openai.UserMessage(logs),
 		},
 	})
