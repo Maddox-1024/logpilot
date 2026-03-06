@@ -42,24 +42,31 @@ type LogPilotSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 	// Loki URL
+	// +kubernetes:validation:Required
 	LokiURL string `json:"lokiURL,omitempty"`
 	// Loki LogQL
+	// +kubernetes:validation:Required
 	LogQL string `json:"logQL,omitempty"`
 	// Interval
 	Interval string `json:"interval,omitempty"`
 	// Model Provider
+	// +kubernetes:validation:Enum=OpenAI;Gemini
 	LLMProvider ModelProvider `json:"llmProvider,omitempty"`
 	// LLM Model
+	// +kubernetes:validation:Required
 	LLMModel string `json:"llmModel,omitempty"`
 	// LLM API Key Secret
+	// *kubernetes:validation:Required
 	LLMAPIKeySecret string `json:"llmAPIKeySecret,omitempty"`
 	// LLM API Key Secret Key
+	// +kubernetes:validation:Required
 	LLMAPIKeySecretKey string `json:"llmAPIKeySecretKey,omitempty"`
 	// OpenAI Config
 	OpenAI *OpenAIConfig `json:"openAI,omitempty"`
 	// Gemini Config
 	Gemini *GeminiConfig `json:"gemini,omitempty"`
 	// Feishu Webhook
+	// +kubernetes:validation:Required
 	LarkWebhook string `json:"larkWebhook,omitempty"`
 }
 

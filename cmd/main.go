@@ -19,8 +19,10 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -203,8 +205,9 @@ func main() {
 	}
 
 	if err = (&controller.LogPilotReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		HTTPClient: &http.Client{Timeout: 10 * time.Second},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "LogPilot")
 		os.Exit(1)

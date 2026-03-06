@@ -44,9 +44,11 @@ import (
 // LogPilotReconciler reconciles a LogPilot object
 type LogPilotReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme     *runtime.Scheme
+	HTTPClient *http.Client
 }
 
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=log.aiops.com,resources=logpilots,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=log.aiops.com,resources=logpilots/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=log.aiops.com,resources=logpilots/finalizers,verbs=update
@@ -84,22 +86,40 @@ func (r *LogPilotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	apiKey, err := r.getSecretValue(ctx, req.Namespace, logPilot.Spec.LLMAPIKeySecret, logPilot.Spec.LLMAPIKeySecretKey)
 	if err != nil {
 		logger.Error(err, "unable to get LLM API key from secret")
-		r.updateStatus(ctx, &logPilot, "", fmt.Sprintf("Secret error: %v", err))
+		if statusErr := r.updateStatus(ctx, &logPilot, "", fmt.Sprintf("Secret error: %v", err)); statusErr != nil {
+			logger.Error(statusErr, "failed to update status for secret retrieval error")
+			return ctrl.Result{}, statusErr
+		}
 		return ctrl.Result{RequeueAfter: interval}, nil
 	}
-	// Loki query
+	// Loki query window:
+	// - normal case: query from last successful check time to now
+	// - first run fallback: query the last "interval"
 	lokiQuery := logPilot.Spec.LogQL
-	endTime := time.Now().UnixNano()
-	startTime := time.Now().Add(-interval).UnixNano()
+	end := time.Now()
+	start := logPilot.Status.LastCheckTime.Time
+	if start.IsZero() {
+		start = end.Add(-interval)
+	}
+	// Guard against clock skew or invalid status time.
+	if start.After(end) {
+		start = end.Add(-interval)
+	}
+
+	endTime := end.UnixNano()
+	startTime := start.UnixNano()
 	fmt.Printf("startTime: %d, endTime: %d\n", startTime, endTime)
 
 	lokiURL := fmt.Sprintf("%s/loki/api/v1/query_range?query=%s&start=%d&end=%d", logPilot.Spec.LokiURL, url.QueryEscape(lokiQuery), startTime, endTime)
-	fmt.Printf("lokiURL: %s\n", lokiURL)
+	// fmt.Printf("lokiURL: %s\n", lokiURL)
 	lokiLogs, err := r.queryLoki(lokiURL)
-	fmt.Println(lokiLogs)
+	// fmt.Println(lokiLogs)
 	if err != nil {
 		logger.Error(err, "unable to query Loki")
-		r.updateStatus(ctx, &logPilot, "", fmt.Sprintf("Loki error: %v", err))
+		if statusErr := r.updateStatus(ctx, &logPilot, "", fmt.Sprintf("Loki error: %v", err)); statusErr != nil {
+			logger.Error(statusErr, "failed to update status for loki query error")
+			return ctrl.Result{}, statusErr
+		}
 		return ctrl.Result{RequeueAfter: interval}, nil
 	}
 
@@ -109,10 +129,15 @@ func (r *LogPilotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		analysisResult, err := r.analyzeLogsWithLLM(logPilot.Spec, apiKey, lokiLogs)
 		if err != nil {
 			logger.Error(err, "unable to analyze logs with LLM")
+			if statusErr := r.updateStatus(ctx, &logPilot, "", fmt.Sprintf("LLM analysis error: %v", err)); statusErr != nil {
+				logger.Error(statusErr, "failed to update status for llm analysis error")
+				return ctrl.Result{}, statusErr
+			}
+			return ctrl.Result{RequeueAfter: interval}, nil
 		}
 		// If the LLM result indicates there is a problem with the logs, send Feishu alert
 		if analysisResult.HasError {
-			err := r.sendLarkAlert(logPilot.Spec.LarkWebhook, analysisResult.Analysis)
+			err := r.sendLarkAlert(ctx, logPilot.Spec.LarkWebhook, analysisResult.Analysis)
 			if err != nil {
 				logger.Error(err, "Failed to send lark alert")
 			}
@@ -120,45 +145,74 @@ func (r *LogPilotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			logger.Info("No issues found in logs according to LLM analysis")
 		}
 		// Update status with analysis result
-		r.updateStatus(ctx, &logPilot, analysisResult.Analysis, "")
+		if statusErr := r.updateStatus(ctx, &logPilot, analysisResult.Analysis, ""); statusErr != nil {
+			logger.Error(statusErr, "failed to update status for successful analysis")
+			return ctrl.Result{}, statusErr
+		}
 		return ctrl.Result{RequeueAfter: interval}, nil
 	} else {
-		r.updateStatus(ctx, &logPilot, "No logs found", "")
+		if statusErr := r.updateStatus(ctx, &logPilot, "No logs found", ""); statusErr != nil {
+			logger.Error(statusErr, "failed to update status for empty log result")
+			return ctrl.Result{}, statusErr
+		}
 	}
 
 	// Reconcile again after 10 seconds
 	return ctrl.Result{RequeueAfter: interval}, nil
 }
 
+type LokiResponse struct {
+	Status string `json:"status"`
+	Data   struct {
+		ResultType string `json:"resultType"`
+		Result     []struct {
+			Stream map[string]string `json:"stream"`
+			Values [][]string        `json:"values"`
+		} `json:"result"`
+	} `json:"data"`
+}
+
 // queryLoki retrieves logs from Loki
 func (r *LogPilotReconciler) queryLoki(lokiURL string) (string, error) {
-	resp, err := http.Get(lokiURL)
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := client.Get(lokiURL)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("loki returned status %d", resp.StatusCode)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
 	}
 
-	var lokiResponse map[string]interface{}
-	err = json.Unmarshal(body, &lokiResponse)
-	if err != nil {
+	var lokiResp LokiResponse
+	if err := json.Unmarshal(body, &lokiResp); err != nil {
 		return "", err
 	}
-	data, ok := lokiResponse["data"].(map[string]interface{})
-	if !ok {
-		return "", fmt.Errorf("data not found")
+
+	if len(lokiResp.Data.Result) == 0 {
+		return "", nil // No logs found
 	}
 
-	result, ok := data["result"].([]interface{})
-	if !ok || len(result) == 0 {
-		return "", fmt.Errorf("result not found")
+	var logs []string
+
+	for _, stream := range lokiResp.Data.Result {
+		for _, entry := range stream.Values {
+			if len(entry) == 2 {
+				logs = append(logs, entry[1])
+			}
+		}
 	}
 
-	return string(body), nil
+	return strings.Join(logs, "\n"), nil
 }
 
 // LLMAnalysisResult is used to store the results of LLM analysis
@@ -199,8 +253,12 @@ func callOpenAI(spec logv1.LogPilotSpec, token, logs string) (*LLMAnalysisResult
 	opts := []openAIOption.RequestOption{
 		openAIOption.WithAPIKey(token),
 	}
-	if spec.OpenAI.BaseURL != "" {
-		opts = append(opts, openAIOption.WithBaseURL(spec.OpenAI.BaseURL))
+
+	cfg := spec.OpenAI
+	if cfg != nil {
+		if cfg.BaseURL != "" {
+			opts = append(opts, openAIOption.WithBaseURL(cfg.BaseURL))
+		}
 	}
 
 	// 2. 初始化 Client
@@ -279,41 +337,52 @@ func parseLLMResponse(resp string) *LLMAnalysisResult {
 }
 
 // sendFeishuAlert sends Feishu alert
-func (r *LogPilotReconciler) sendLarkAlert(webhook, analysis string) error {
-	// Feishu message content
-	message := map[string]interface{}{
-		"msg_type": "text",
-		"content": map[string]string{
-			"text": analysis,
-		},
+func (r *LogPilotReconciler) sendLarkAlert(ctx context.Context, webhook, analysis string) error {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	type LarkMessage struct {
+		MsgType string `json:"msg_type"`
+		Content struct {
+			Text string `json:"text"`
+		} `json:"content"`
 	}
-	// Serialize message content to JSON
-	messageBody, _ := json.Marshal(message)
-	// Create HTTP POST request
-	req, err := http.NewRequest("POST", webhook, bytes.NewBuffer(messageBody))
+
+	message := LarkMessage{
+		MsgType: "text",
+	}
+	message.Content.Text = analysis
+
+	messageBody, err := json.Marshal(message)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal lark message: %w", err)
 	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhook, bytes.NewBuffer(messageBody))
+	if err != nil {
+		return fmt.Errorf("create lark request: %w", err)
+	}
+
 	req.Header.Set("Content-Type", "application/json")
 	// Send request
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := r.HTTPClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("send lark request: %w", err)
 	}
-	// Check response status
 	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("status code: %d", resp.StatusCode)
+		return fmt.Errorf("lark webhook failed: status=%d body=%s", resp.StatusCode, string(respBody))
 	}
 	return nil
 }
 
-func (r *LogPilotReconciler) updateStatus(ctx context.Context, logPilot *logv1.LogPilot, analysis, errMsg string) {
+func (r *LogPilotReconciler) updateStatus(ctx context.Context, logPilot *logv1.LogPilot, analysis, errMsg string) error {
 	logPilot.Status.LastCheckTime = metav1.Now()
 	logPilot.Status.LastAnalysis = analysis
 	logPilot.Status.LastError = errMsg
-	r.Status().Update(ctx, logPilot)
+	return r.Status().Update(ctx, logPilot)
 }
 
 // SetupWithManager sets up the controller with the Manager.

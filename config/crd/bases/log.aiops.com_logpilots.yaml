@@ -49,7 +49,9 @@ spec:
                 description: Feishu Webhook
                 type: string
               llmAPIKeySecret:
-                description: LLM API Key Secret
+                description: |-
+                  LLM API Key Secret
+                  *kubernetes:validation:Required
                 type: string
               llmAPIKeySecretKey:
                 description: LLM API Key Secret Key
