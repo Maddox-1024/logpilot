@@ -44,14 +44,13 @@ spec:
                 type: object
               interval:
                 description: Interval
+                pattern: ^(\\d+(ns|us|ms|s|m|h))+$
                 type: string
               larkWebhook:
                 description: Feishu Webhook
                 type: string
               llmAPIKeySecret:
-                description: |-
-                  LLM API Key Secret
-                  *kubernetes:validation:Required
+                description: LLM API Key Secret
                 type: string
               llmAPIKeySecretKey:
                 description: LLM API Key Secret Key
@@ -61,6 +60,9 @@ spec:
                 type: string
               llmProvider:
                 description: Model Provider
+                enum:
+                - OpenAI
+                - Gemini
                 type: string
               logQL:
                 description: Loki LogQL
@@ -78,19 +80,30 @@ spec:
                     description: Base URL for the OpenAI API
                     type: string
                 type: object
+            required:
+            - larkWebhook
+            - llmAPIKeySecret
+            - llmAPIKeySecretKey
+            - llmModel
+            - llmProvider
+            - logQL
+            - lokiURL
             type: object
           status:
             description: LogPilotStatus defines the observed state of LogPilot.
             properties:
               lastAnalysis:
                 type: string
-              lastCheckTime:
+              lastAttemptTime:
                 description: |-
                   INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
                   Important: Run "make" to regenerate code after modifying this file
                 format: date-time
                 type: string
               lastError:
+                type: string
+              lastSuccessTime:
+                format: date-time
                 type: string
             type: object
         type: object

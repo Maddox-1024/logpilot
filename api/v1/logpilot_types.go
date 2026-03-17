@@ -42,31 +42,33 @@ type LogPilotSpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
 	// Loki URL
-	// +kubernetes:validation:Required
+	// +kubebuilder:validation:Required
 	LokiURL string `json:"lokiURL,omitempty"`
 	// Loki LogQL
-	// +kubernetes:validation:Required
+	// +kubebuilder:validation:Required
 	LogQL string `json:"logQL,omitempty"`
 	// Interval
+	// +kubebuilder:validation:Pattern=`^(\\d+(ns|us|ms|s|m|h))+$`
 	Interval string `json:"interval,omitempty"`
 	// Model Provider
-	// +kubernetes:validation:Enum=OpenAI;Gemini
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Enum=OpenAI;Gemini
 	LLMProvider ModelProvider `json:"llmProvider,omitempty"`
 	// LLM Model
-	// +kubernetes:validation:Required
+	// +kubebuilder:validation:Required
 	LLMModel string `json:"llmModel,omitempty"`
 	// LLM API Key Secret
-	// *kubernetes:validation:Required
+	// +kubebuilder:validation:Required
 	LLMAPIKeySecret string `json:"llmAPIKeySecret,omitempty"`
 	// LLM API Key Secret Key
-	// +kubernetes:validation:Required
+	// +kubebuilder:validation:Required
 	LLMAPIKeySecretKey string `json:"llmAPIKeySecretKey,omitempty"`
 	// OpenAI Config
 	OpenAI *OpenAIConfig `json:"openAI,omitempty"`
 	// Gemini Config
 	Gemini *GeminiConfig `json:"gemini,omitempty"`
 	// Feishu Webhook
-	// +kubernetes:validation:Required
+	// +kubebuilder:validation:Required
 	LarkWebhook string `json:"larkWebhook,omitempty"`
 }
 
@@ -74,9 +76,10 @@ type LogPilotSpec struct {
 type LogPilotStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-	LastCheckTime metav1.Time `json:"lastCheckTime,omitempty"`
-	LastAnalysis  string      `json:"lastAnalysis,omitempty"`
-	LastError     string      `json:"lastError,omitempty"`
+	LastAttemptTime metav1.Time `json:"lastAttemptTime,omitempty"`
+	LastSuccessTime metav1.Time `json:"lastSuccessTime,omitempty"`
+	LastAnalysis    string      `json:"lastAnalysis,omitempty"`
+	LastError       string      `json:"lastError,omitempty"`
 }
 
 // +kubebuilder:object:root=true

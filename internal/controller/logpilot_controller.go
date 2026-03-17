@@ -24,6 +24,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,11 +37,18 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	logv1 "llm-log-operator/api/v1"
+)
+
+const (
+	maxLogEntries     = 2000
+	maxLogLineBytes   = 2048
+	maxClusterSamples = 3
 )
 
 // LogPilotReconciler reconciles a LogPilot object
@@ -74,19 +84,25 @@ func (r *LogPilotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	interval, err := time.ParseDuration(logPilot.Spec.Interval)
 	if err != nil {
 		logger.Error(err, "unable to parse interval", "interval", logPilot.Spec.Interval)
-		// Use default interval of 10 seconds if parsing fails
+		// Use default interval of 1 minute if parsing fails.
+		interval = time.Minute
+	}
+	if interval <= 0 {
 		interval = time.Minute
 	}
 
-	lastTime := logPilot.Status.LastCheckTime.Time
-	if !lastTime.IsZero() && time.Since(lastTime) < interval {
-		return ctrl.Result{RequeueAfter: interval - time.Since(lastTime)}, nil
+	lastAttemptTime := logPilot.Status.LastAttemptTime.Time
+	if !lastAttemptTime.IsZero() {
+		elapsed := time.Since(lastAttemptTime)
+		if elapsed < interval {
+			return ctrl.Result{RequeueAfter: interval - elapsed}, nil
+		}
 	}
 
 	apiKey, err := r.getSecretValue(ctx, req.Namespace, logPilot.Spec.LLMAPIKeySecret, logPilot.Spec.LLMAPIKeySecretKey)
 	if err != nil {
 		logger.Error(err, "unable to get LLM API key from secret")
-		if statusErr := r.updateStatus(ctx, &logPilot, "", fmt.Sprintf("Secret error: %v", err)); statusErr != nil {
+		if statusErr := r.updateStatusError(ctx, &logPilot, fmt.Sprintf("Secret error: %v", err)); statusErr != nil {
 			logger.Error(statusErr, "failed to update status for secret retrieval error")
 			return ctrl.Result{}, statusErr
 		}
@@ -97,7 +113,7 @@ func (r *LogPilotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// - first run fallback: query the last "interval"
 	lokiQuery := logPilot.Spec.LogQL
 	end := time.Now()
-	start := logPilot.Status.LastCheckTime.Time
+	start := logPilot.Status.LastSuccessTime.Time
 	if start.IsZero() {
 		start = end.Add(-interval)
 	}
@@ -108,15 +124,23 @@ func (r *LogPilotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	endTime := end.UnixNano()
 	startTime := start.UnixNano()
-	fmt.Printf("startTime: %d, endTime: %d\n", startTime, endTime)
+	logger.Info("query window", "startTime", startTime, "endTime", endTime)
 
 	lokiURL := fmt.Sprintf("%s/loki/api/v1/query_range?query=%s&start=%d&end=%d", logPilot.Spec.LokiURL, url.QueryEscape(lokiQuery), startTime, endTime)
 	// fmt.Printf("lokiURL: %s\n", lokiURL)
-	lokiLogs, err := r.queryLoki(lokiURL)
-	// fmt.Println(lokiLogs)
+	lokiCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	// Mark attempt time before making external calls to avoid duplicate inflight work.
+	if statusErr := r.updateStatusAttempt(ctx, &logPilot); statusErr != nil {
+		logger.Error(statusErr, "failed to update status for attempt time")
+		return ctrl.Result{}, statusErr
+	}
+
+	lokiEntries, err := r.queryLoki(lokiCtx, lokiURL)
 	if err != nil {
 		logger.Error(err, "unable to query Loki")
-		if statusErr := r.updateStatus(ctx, &logPilot, "", fmt.Sprintf("Loki error: %v", err)); statusErr != nil {
+		if statusErr := r.updateStatusError(ctx, &logPilot, fmt.Sprintf("Loki error: %v", err)); statusErr != nil {
 			logger.Error(statusErr, "failed to update status for loki query error")
 			return ctrl.Result{}, statusErr
 		}
@@ -124,34 +148,58 @@ func (r *LogPilotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	// If there are log results, call LLM for analysis
-	if lokiLogs != "" {
-		fmt.Println("send log to llm")
-		analysisResult, err := r.analyzeLogsWithLLM(logPilot.Spec, apiKey, lokiLogs)
+	if len(lokiEntries) > 0 {
+		logger.Info("send logs to llm")
+		trimmed := trimEntries(lokiEntries, maxLogEntries, maxLogLineBytes)
+		enriched := enrichEntries(trimmed)
+		errEntries := filterSeverities(enriched, "error", "critical")
+		patternsAll := detectPatterns(enriched)
+		if len(errEntries) == 0 {
+			if statusErr := r.updateStatusSuccess(ctx, &logPilot, "No error/critical logs found"); statusErr != nil {
+				logger.Error(statusErr, "failed to update status for no error/critical logs")
+				return ctrl.Result{}, statusErr
+			}
+			return ctrl.Result{RequeueAfter: interval}, nil
+		}
+		clusters := clusterEntries(errEntries)
+		patternsErr := detectPatterns(errEntries)
+		summary := buildSummary(errEntries, clusters, patternsErr)
+		analysisText := "Deterministic summary:\n" + summary
+
+		llmCtx, llmCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer llmCancel()
+
+		analysisResult, err := r.analyzeLogsWithLLM(llmCtx, logPilot.Spec, apiKey, summary)
 		if err != nil {
 			logger.Error(err, "unable to analyze logs with LLM")
-			if statusErr := r.updateStatus(ctx, &logPilot, "", fmt.Sprintf("LLM analysis error: %v", err)); statusErr != nil {
+			if statusErr := r.updateStatusError(ctx, &logPilot, fmt.Sprintf("LLM analysis error: %v", err)); statusErr != nil {
 				logger.Error(statusErr, "failed to update status for llm analysis error")
 				return ctrl.Result{}, statusErr
 			}
 			return ctrl.Result{RequeueAfter: interval}, nil
 		}
-		// If the LLM result indicates there is a problem with the logs, send Feishu alert
-		if analysisResult.HasError {
-			err := r.sendLarkAlert(ctx, logPilot.Spec.LarkWebhook, analysisResult.Analysis)
+		if analysisResult != nil && strings.TrimSpace(analysisResult.Analysis) != "" {
+			analysisText = analysisText + "\n\nLLM reasoning:\n" + analysisResult.Analysis
+		}
+
+		hasError := shouldAlert(errEntries, patternsAll)
+		// If the deterministic result indicates there is a problem with the logs, send Feishu alert
+		if hasError {
+			err := r.sendLarkAlert(ctx, logPilot.Spec.LarkWebhook, analysisText)
 			if err != nil {
 				logger.Error(err, "Failed to send lark alert")
 			}
 		} else {
-			logger.Info("No issues found in logs according to LLM analysis")
+			logger.Info("No issues found in logs according to deterministic analysis")
 		}
 		// Update status with analysis result
-		if statusErr := r.updateStatus(ctx, &logPilot, analysisResult.Analysis, ""); statusErr != nil {
+		if statusErr := r.updateStatusSuccess(ctx, &logPilot, analysisText); statusErr != nil {
 			logger.Error(statusErr, "failed to update status for successful analysis")
 			return ctrl.Result{}, statusErr
 		}
 		return ctrl.Result{RequeueAfter: interval}, nil
 	} else {
-		if statusErr := r.updateStatus(ctx, &logPilot, "No logs found", ""); statusErr != nil {
+		if statusErr := r.updateStatusSuccess(ctx, &logPilot, "No logs found"); statusErr != nil {
 			logger.Error(statusErr, "failed to update status for empty log result")
 			return ctrl.Result{}, statusErr
 		}
@@ -163,7 +211,10 @@ func (r *LogPilotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 type LokiResponse struct {
 	Status string `json:"status"`
-	Data   struct {
+	Error  string `json:"error,omitempty"`
+	// Loki may return errorType for non-success responses.
+	ErrorType string `json:"errorType,omitempty"`
+	Data      struct {
 		ResultType string `json:"resultType"`
 		Result     []struct {
 			Stream map[string]string `json:"stream"`
@@ -172,47 +223,67 @@ type LokiResponse struct {
 	} `json:"data"`
 }
 
-// queryLoki retrieves logs from Loki
-func (r *LogPilotReconciler) queryLoki(lokiURL string) (string, error) {
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
+type LogEntry struct {
+	Timestamp time.Time
+	Line      string
+	Labels    map[string]string
+	Severity  string
+}
 
-	resp, err := client.Get(lokiURL)
+// queryLoki retrieves logs from Loki
+func (r *LogPilotReconciler) queryLoki(ctx context.Context, lokiURL string) ([]LogEntry, error) {
+	client := r.httpClient()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, lokiURL, nil)
 	if err != nil {
-		return "", err
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("loki returned status %d", resp.StatusCode)
+		return nil, fmt.Errorf("loki returned status %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	var lokiResp LokiResponse
 	if err := json.Unmarshal(body, &lokiResp); err != nil {
-		return "", err
+		return nil, err
+	}
+	if lokiResp.Status != "success" {
+		return nil, fmt.Errorf("loki returned status=%s errorType=%s error=%s", lokiResp.Status, lokiResp.ErrorType, lokiResp.Error)
 	}
 
 	if len(lokiResp.Data.Result) == 0 {
-		return "", nil // No logs found
+		return nil, nil // No logs found
 	}
 
-	var logs []string
+	var entries []LogEntry
 
 	for _, stream := range lokiResp.Data.Result {
 		for _, entry := range stream.Values {
 			if len(entry) == 2 {
-				logs = append(logs, entry[1])
+				ts, err := parseLokiTime(entry[0])
+				if err != nil {
+					ts = time.Now()
+				}
+				entries = append(entries, LogEntry{
+					Timestamp: ts,
+					Line:      entry[1],
+					Labels:    stream.Stream,
+				})
 			}
 		}
 	}
 
-	return strings.Join(logs, "\n"), nil
+	return entries, nil
 }
 
 // LLMAnalysisResult is used to store the results of LLM analysis
@@ -234,22 +305,23 @@ func (r *LogPilotReconciler) getSecretValue(ctx context.Context, namespace, name
 	return string(value), nil
 }
 
-const systemPrompt = `你是一名经验丰富的日志分析专家和系统优化顾问。以下日志是从日志系统里获取到的日志。你的任务是：给出环境（根据namespace标签确定是哪个环境）,给出服务（根据app标签确定是哪个服务），分析日志内容，总结关键信息，提出可能的原因，给出简短的建议。如果遇到严重问题，例如外部系统请求失败、系统故障、致命错误、数据库连接异常等严重问题时，在内容里返回[lark]标识`
+const systemPrompt = `你是一名经验丰富的日志分析专家和系统优化顾问。以下输入是经过自动严重级别判断、聚类去重与根因模式检测后的JSON摘要。
+你的任务是：给出环境（根据namespace标签确定是哪个环境）,给出服务（根据app标签确定是哪个服务），基于摘要进行原因推断，给出关键结论和简短建议。不要重新判断严重级别，也不要输出[lark]。`
 
 // analyzeLogsWithLLM calls the LLM interface to analyze logs
-func (r *LogPilotReconciler) analyzeLogsWithLLM(spec logv1.LogPilotSpec, token, logs string) (*LLMAnalysisResult, error) {
+func (r *LogPilotReconciler) analyzeLogsWithLLM(ctx context.Context, spec logv1.LogPilotSpec, token, summary string) (*LLMAnalysisResult, error) {
 	switch spec.LLMProvider {
 	case "OpenAI":
-		return callOpenAI(spec, token, logs)
+		return callOpenAI(ctx, spec, token, summary)
 	case "Gemini":
-		return callGemini(spec, token, logs)
+		return callGemini(ctx, spec, token, summary)
 	default:
 		return nil, fmt.Errorf("unsupported LLM provider: %s", spec.LLMProvider)
 	}
 }
 
-func callOpenAI(spec logv1.LogPilotSpec, token, logs string) (*LLMAnalysisResult, error) {
-	// 1. 配置 Client 选项
+func callOpenAI(ctx context.Context, spec logv1.LogPilotSpec, token, summary string) (*LLMAnalysisResult, error) {
+
 	opts := []openAIOption.RequestOption{
 		openAIOption.WithAPIKey(token),
 	}
@@ -261,15 +333,13 @@ func callOpenAI(spec logv1.LogPilotSpec, token, logs string) (*LLMAnalysisResult
 		}
 	}
 
-	// 2. 初始化 Client
 	client := openai.NewClient(opts...)
 
-	// 4. 发起调用
-	completion, err := client.Chat.Completions.New(context.TODO(), openai.ChatCompletionNewParams{
+	completion, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
 		Model: spec.LLMModel,
 		Messages: []openai.ChatCompletionMessageParamUnion{
 			openai.SystemMessage(systemPrompt),
-			openai.UserMessage(logs),
+			openai.UserMessage(summary),
 		},
 	})
 
@@ -281,14 +351,12 @@ func callOpenAI(spec logv1.LogPilotSpec, token, logs string) (*LLMAnalysisResult
 		return nil, fmt.Errorf("no choices returned")
 	}
 
-	// 5. 解析结果
 	analysis := completion.Choices[0].Message.Content
 
-	return parseLLMResponse(analysis), nil
+	return &LLMAnalysisResult{Analysis: analysis}, nil
 }
 
-func callGemini(spec logv1.LogPilotSpec, token, logs string) (*LLMAnalysisResult, error) {
-	ctx := context.Background()
+func callGemini(ctx context.Context, spec logv1.LogPilotSpec, token, summary string) (*LLMAnalysisResult, error) {
 	client, err := genai.NewClient(ctx, googleOption.WithAPIKey(token))
 	if err != nil {
 		return nil, err
@@ -296,11 +364,10 @@ func callGemini(spec logv1.LogPilotSpec, token, logs string) (*LLMAnalysisResult
 	defer client.Close()
 
 	modelClient := client.GenerativeModel(spec.LLMModel)
-	prompt := genai.Text(fmt.Sprintf("%s\n%s", systemPrompt, logs))
+	prompt := genai.Text(fmt.Sprintf("%s\n%s", systemPrompt, summary))
 
 	resp, err := modelClient.GenerateContent(ctx, prompt)
 	if err != nil {
-		fmt.Printf("ChatCompletion error: %v\n", err)
 		return nil, err
 	}
 	var analysis string
@@ -316,24 +383,7 @@ func callGemini(spec logv1.LogPilotSpec, token, logs string) (*LLMAnalysisResult
 		}
 	}
 
-	return parseLLMResponse(analysis), nil
-}
-
-// parseLLMResponse parses the response from the LLM API
-func parseLLMResponse(resp string) *LLMAnalysisResult {
-
-	result := &LLMAnalysisResult{
-		Analysis: resp, // Get analysis results from text returned by LLM
-	}
-
-	// Simple judgment whether the analysis result contains error identifiers
-	if strings.Contains(strings.ToLower(result.Analysis), "lark") {
-		result.HasError = true
-	} else {
-		result.HasError = false
-	}
-
-	return result
+	return &LLMAnalysisResult{Analysis: analysis}, nil
 }
 
 // sendFeishuAlert sends Feishu alert
@@ -364,7 +414,7 @@ func (r *LogPilotReconciler) sendLarkAlert(ctx context.Context, webhook, analysi
 
 	req.Header.Set("Content-Type", "application/json")
 	// Send request
-	resp, err := r.HTTPClient.Do(req)
+	resp, err := r.httpClient().Do(req)
 	if err != nil {
 		return fmt.Errorf("send lark request: %w", err)
 	}
@@ -378,11 +428,420 @@ func (r *LogPilotReconciler) sendLarkAlert(ctx context.Context, webhook, analysi
 	return nil
 }
 
-func (r *LogPilotReconciler) updateStatus(ctx context.Context, logPilot *logv1.LogPilot, analysis, errMsg string) error {
-	logPilot.Status.LastCheckTime = metav1.Now()
-	logPilot.Status.LastAnalysis = analysis
-	logPilot.Status.LastError = errMsg
-	return r.Status().Update(ctx, logPilot)
+func (r *LogPilotReconciler) httpClient() *http.Client {
+	if r.HTTPClient != nil {
+		return r.HTTPClient
+	}
+	return &http.Client{Timeout: 10 * time.Second}
+}
+
+func (r *LogPilotReconciler) updateStatusAttempt(ctx context.Context, logPilot *logv1.LogPilot) error {
+	key := client.ObjectKeyFromObject(logPilot)
+	return r.updateStatusWithRetry(ctx, key, func(current *logv1.LogPilot) {
+		current.Status.LastAttemptTime = metav1.Now()
+	})
+}
+
+func (r *LogPilotReconciler) updateStatusSuccess(ctx context.Context, logPilot *logv1.LogPilot, analysis string) error {
+	key := client.ObjectKeyFromObject(logPilot)
+	return r.updateStatusWithRetry(ctx, key, func(current *logv1.LogPilot) {
+		current.Status.LastAttemptTime = metav1.Now()
+		current.Status.LastSuccessTime = current.Status.LastAttemptTime
+		current.Status.LastAnalysis = analysis
+		current.Status.LastError = ""
+	})
+}
+
+func (r *LogPilotReconciler) updateStatusError(ctx context.Context, logPilot *logv1.LogPilot, errMsg string) error {
+	key := client.ObjectKeyFromObject(logPilot)
+	return r.updateStatusWithRetry(ctx, key, func(current *logv1.LogPilot) {
+		current.Status.LastAttemptTime = metav1.Now()
+		current.Status.LastError = errMsg
+	})
+}
+
+func (r *LogPilotReconciler) updateStatusWithRetry(ctx context.Context, key client.ObjectKey, mutate func(*logv1.LogPilot)) error {
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var current logv1.LogPilot
+		if err := r.Get(ctx, key, &current); err != nil {
+			return err
+		}
+		mutate(&current)
+		return r.Status().Update(ctx, &current)
+	})
+}
+
+func parseLokiTime(ns string) (time.Time, error) {
+	// Loki timestamps are nanoseconds since epoch.
+	nano, err := strconv.ParseInt(ns, 10, 64)
+	if err != nil {
+		return time.Time{}, err
+	}
+	// Convert nanoseconds to time.Time.
+	return time.Unix(0, nano), nil
+}
+
+func trimEntries(entries []LogEntry, maxEntries, maxLineBytes int) []LogEntry {
+	// Fast path for empty input.
+	if len(entries) == 0 {
+		return entries
+	}
+	// Ensure stable chronological order for trimming and summaries.
+	if !isSortedByTime(entries) {
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].Timestamp.Before(entries[j].Timestamp)
+		})
+	}
+	// Keep only the most recent N entries.
+	if len(entries) > maxEntries {
+		entries = entries[len(entries)-maxEntries:]
+	}
+	// Hard cap each log line length to avoid payload bloat.
+	for i := range entries {
+		if len(entries[i].Line) > maxLineBytes {
+			entries[i].Line = entries[i].Line[:maxLineBytes]
+		}
+	}
+	return entries
+}
+
+func isSortedByTime(entries []LogEntry) bool {
+	for i := 1; i < len(entries); i++ {
+		if entries[i].Timestamp.Before(entries[i-1].Timestamp) {
+			return false
+		}
+	}
+	return true
+}
+
+func enrichEntries(entries []LogEntry) []LogEntry {
+	// Attach deterministic severity to each entry.
+	out := make([]LogEntry, 0, len(entries))
+	for _, e := range entries {
+		e.Severity = classifySeverity(e)
+		out = append(out, e)
+	}
+	return out
+}
+
+func filterSeverities(entries []LogEntry, severities ...string) []LogEntry {
+	if len(entries) == 0 {
+		return entries
+	}
+	if len(severities) == 0 {
+		return nil
+	}
+	allowed := make(map[string]struct{}, len(severities))
+	for _, s := range severities {
+		allowed[s] = struct{}{}
+	}
+	out := make([]LogEntry, 0, len(entries))
+	for _, e := range entries {
+		if _, ok := allowed[e.Severity]; ok {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func classifySeverity(e LogEntry) string {
+	// Normalize content to lower case for matching.
+	lower := strings.ToLower(e.Line)
+	// Prefer explicit labels if present.
+	if lvl, ok := labelValue(e.Labels, "level", "severity", "log_level"); ok {
+		switch strings.ToLower(lvl) {
+		case "fatal", "panic", "critical", "crit":
+			return "critical"
+		case "error", "err":
+			return "error"
+		case "warn", "warning":
+			return "warn"
+		case "info", "notice":
+			return "info"
+		case "debug", "trace":
+			return "debug"
+		}
+	}
+
+	// Keyword-based detection for critical conditions.
+	if hasAny(lower, "panic", "fatal", "segmentation fault", "oom", "out of memory") {
+		return "critical"
+	}
+	// Keyword-based detection for errors.
+	if hasAny(lower, "error", "failed", "exception", "stacktrace", "connection refused", "context deadline exceeded", "timeout") {
+		return "error"
+	}
+	// Keyword-based detection for warnings.
+	if hasAny(lower, "warn", "retry", "rate limit", "slow", "throttle") {
+		return "warn"
+	}
+	// HTTP 5xx is treated as error.
+	if httpStatusClass(lower) == 5 {
+		return "error"
+	}
+	// HTTP 4xx is treated as warning.
+	if httpStatusClass(lower) == 4 {
+		return "warn"
+	}
+	// Default to info when no signal is found.
+	return "info"
+}
+
+func labelValue(labels map[string]string, keys ...string) (string, bool) {
+	// Return the first non-empty label among the provided keys.
+	for _, k := range keys {
+		if v, ok := labels[k]; ok && v != "" {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+func hasAny(s string, terms ...string) bool {
+	// Simple substring matching for any provided term.
+	for _, t := range terms {
+		if strings.Contains(s, t) {
+			return true
+		}
+	}
+	return false
+}
+
+func httpStatusClass(line string) int {
+	// Extract the first 3-digit HTTP status code if present.
+	m := reHTTPStatus.FindStringSubmatch(line)
+	if len(m) == 2 {
+		switch m[1] {
+		case "5":
+			return 5
+		case "4":
+			return 4
+		case "3":
+			return 3
+		case "2":
+			return 2
+		case "1":
+			return 1
+		}
+	}
+	return 0
+}
+
+type Cluster struct {
+	Key      string            `json:"key"`
+	Count    int               `json:"count"`
+	Severity string            `json:"severity"`
+	Samples  []string          `json:"samples"`
+	Labels   map[string]string `json:"labels,omitempty"`
+}
+
+func clusterEntries(entries []LogEntry) []Cluster {
+	// Group entries by normalized line template.
+	buckets := make(map[string]*Cluster, len(entries))
+	for _, e := range entries {
+		key := normalizeLine(e.Line)
+		b, ok := buckets[key]
+		if !ok {
+			// Create new cluster bucket on first sight.
+			b = &Cluster{
+				Key:      key,
+				Severity: e.Severity,
+				Labels:   e.Labels,
+			}
+			buckets[key] = b
+		}
+		// Increase cluster occurrence count.
+		b.Count++
+		// Store a few raw samples for context.
+		if len(b.Samples) < maxClusterSamples {
+			b.Samples = append(b.Samples, e.Line)
+		}
+		// Keep the most severe level seen in this cluster.
+		if severityRank(e.Severity) > severityRank(b.Severity) {
+			b.Severity = e.Severity
+		}
+	}
+
+	out := make([]Cluster, 0, len(buckets))
+	for _, v := range buckets {
+		out = append(out, *v)
+	}
+	// Sort by frequency, then by severity.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Count == out[j].Count {
+			return severityRank(out[i].Severity) > severityRank(out[j].Severity)
+		}
+		return out[i].Count > out[j].Count
+	})
+	return out
+}
+
+func severityRank(s string) int {
+	// Numeric ordering for severity comparison.
+	switch s {
+	case "critical":
+		return 4
+	case "error":
+		return 3
+	case "warn":
+		return 2
+	case "info":
+		return 1
+	default:
+		return 0
+	}
+}
+
+var (
+	reUUID       = regexp.MustCompile(`\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b`)
+	reHex        = regexp.MustCompile(`\b0x[0-9a-fA-F]+\b`)
+	reIP         = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}\b`)
+	reNum        = regexp.MustCompile(`\b\d+\b`)
+	reSpace      = regexp.MustCompile(`\s+`)
+	reHTTPStatus = regexp.MustCompile(`\b([1-5])[0-9]{2}\b`)
+)
+
+func normalizeLine(line string) string {
+	// Normalize casing and trim whitespace first.
+	s := strings.ToLower(strings.TrimSpace(line))
+	// Replace high-cardinality tokens with placeholders.
+	s = reUUID.ReplaceAllString(s, "{uuid}")
+	s = reHex.ReplaceAllString(s, "{hex}")
+	s = reIP.ReplaceAllString(s, "{ip}")
+	s = reNum.ReplaceAllString(s, "{n}")
+	// Collapse multiple spaces for stable matching.
+	s = reSpace.ReplaceAllString(s, " ")
+	return s
+}
+
+type PatternHit struct {
+	Name     string `json:"name"`
+	Severity string `json:"severity"`
+	Count    int    `json:"count"`
+	Example  string `json:"example,omitempty"`
+}
+
+func detectPatterns(entries []LogEntry) []PatternHit {
+	// Rules are deterministic pattern matchers with severity.
+	type rule struct {
+		name     string
+		severity string
+		match    func(string) bool
+	}
+
+	rules := []rule{
+		{name: "database connection error", severity: "error", match: func(s string) bool { return hasAny(s, "connection refused", "dial tcp", "db connection", "sql:") }},
+		{name: "timeout", severity: "error", match: func(s string) bool { return hasAny(s, "timeout", "context deadline exceeded") }},
+		{name: "out of memory", severity: "critical", match: func(s string) bool { return hasAny(s, "oom", "out of memory", "killed process") }},
+		{name: "disk full", severity: "error", match: func(s string) bool { return hasAny(s, "no space left on device", "disk full") }},
+		{name: "permission denied", severity: "error", match: func(s string) bool { return hasAny(s, "permission denied", "access denied") }},
+		{name: "tls error", severity: "error", match: func(s string) bool { return hasAny(s, "tls", "x509", "certificate") }},
+		{name: "upstream unavailable", severity: "error", match: func(s string) bool { return hasAny(s, "503", "502", "bad gateway", "service unavailable") }},
+	}
+
+	hits := make(map[string]*PatternHit, len(rules))
+	for _, e := range entries {
+		lower := strings.ToLower(e.Line)
+		for _, r := range rules {
+			if r.match(lower) {
+				// Record the first example and count occurrences.
+				h, ok := hits[r.name]
+				if !ok {
+					h = &PatternHit{Name: r.name, Severity: r.severity, Example: e.Line}
+					hits[r.name] = h
+				}
+				h.Count++
+			}
+		}
+	}
+	out := make([]PatternHit, 0, len(hits))
+	for _, v := range hits {
+		out = append(out, *v)
+	}
+	// Sort by severity then count to surface most important issues first.
+	sort.Slice(out, func(i, j int) bool {
+		if severityRank(out[i].Severity) == severityRank(out[j].Severity) {
+			return out[i].Count > out[j].Count
+		}
+		return severityRank(out[i].Severity) > severityRank(out[j].Severity)
+	})
+	return out
+}
+
+type SummaryPayload struct {
+	Window struct {
+		Start string `json:"start"`
+		End   string `json:"end"`
+	} `json:"window"`
+	SeverityCount map[string]int `json:"severityCount"`
+	TopLabels     map[string]int `json:"topLabels"`
+	Clusters      []Cluster      `json:"clusters"`
+	Patterns      []PatternHit   `json:"patterns"`
+}
+
+func buildSummary(entries []LogEntry, clusters []Cluster, patterns []PatternHit) string {
+	// Assemble a compact JSON payload for LLM reasoning.
+	payload := SummaryPayload{
+		SeverityCount: make(map[string]int),
+		TopLabels:     make(map[string]int),
+		Clusters:      limitClusters(clusters, 20),
+		Patterns:      limitPatterns(patterns, 20),
+	}
+	if len(entries) > 0 {
+		// Window boundaries reflect the trimmed, sorted entries.
+		payload.Window.Start = entries[0].Timestamp.Format(time.RFC3339)
+		payload.Window.End = entries[len(entries)-1].Timestamp.Format(time.RFC3339)
+	}
+	for _, e := range entries {
+		// Count severities.
+		payload.SeverityCount[e.Severity]++
+		// Track namespace distribution.
+		if ns, ok := labelValue(e.Labels, "namespace", "k8s_namespace", "kubernetes_namespace"); ok {
+			payload.TopLabels["namespace:"+ns]++
+		}
+		// Track app distribution.
+		if app, ok := labelValue(e.Labels, "app", "app_kubernetes_io_name", "app_kubernetes_io_instance", "k8s_app"); ok {
+			payload.TopLabels["app:"+app]++
+		}
+	}
+	// Serialize for LLM consumption.
+	b, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+func limitClusters(in []Cluster, max int) []Cluster {
+	// Defensive bounds for summary size.
+	if len(in) <= max {
+		return in
+	}
+	return in[:max]
+}
+
+func limitPatterns(in []PatternHit, max int) []PatternHit {
+	// Defensive bounds for summary size.
+	if len(in) <= max {
+		return in
+	}
+	return in[:max]
+}
+
+func shouldAlert(entries []LogEntry, patterns []PatternHit) bool {
+	// Alert if any log entry is error/critical.
+	for _, e := range entries {
+		if e.Severity == "critical" || e.Severity == "error" {
+			return true
+		}
+	}
+	// Alert if any detected pattern is error/critical.
+	for _, p := range patterns {
+		if p.Severity == "critical" || p.Severity == "error" {
+			return true
+		}
+	}
+	return false
 }
 
 // SetupWithManager sets up the controller with the Manager.
