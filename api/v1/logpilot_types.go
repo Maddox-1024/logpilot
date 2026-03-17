@@ -43,33 +43,33 @@ type LogPilotSpec struct {
 	// Important: Run "make" to regenerate code after modifying this file
 	// Loki URL
 	// +kubebuilder:validation:Required
-	LokiURL string `json:"lokiURL,omitempty"`
+	LokiURL string `json:"lokiURL"`
 	// Loki LogQL
 	// +kubebuilder:validation:Required
-	LogQL string `json:"logQL,omitempty"`
+	LogQL string `json:"logQL"`
 	// Interval
 	// +kubebuilder:validation:Pattern=`^(\\d+(ns|us|ms|s|m|h))+$`
 	Interval string `json:"interval,omitempty"`
 	// Model Provider
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Enum=OpenAI;Gemini
-	LLMProvider ModelProvider `json:"llmProvider,omitempty"`
+	LLMProvider ModelProvider `json:"llmProvider"`
 	// LLM Model
 	// +kubebuilder:validation:Required
-	LLMModel string `json:"llmModel,omitempty"`
+	LLMModel string `json:"llmModel"`
 	// LLM API Key Secret
 	// +kubebuilder:validation:Required
-	LLMAPIKeySecret string `json:"llmAPIKeySecret,omitempty"`
+	LLMAPIKeySecret string `json:"llmAPIKeySecret"`
 	// LLM API Key Secret Key
 	// +kubebuilder:validation:Required
-	LLMAPIKeySecretKey string `json:"llmAPIKeySecretKey,omitempty"`
+	LLMAPIKeySecretKey string `json:"llmAPIKeySecretKey"`
 	// OpenAI Config
 	OpenAI *OpenAIConfig `json:"openAI,omitempty"`
 	// Gemini Config
 	Gemini *GeminiConfig `json:"gemini,omitempty"`
 	// Feishu Webhook
 	// +kubebuilder:validation:Required
-	LarkWebhook string `json:"larkWebhook,omitempty"`
+	LarkWebhook string `json:"larkWebhook"`
 }
 
 // LogPilotStatus defines the observed state of LogPilot.
