@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -50,6 +51,27 @@ const (
 	maxLogLineBytes   = 2048
 	maxClusterSamples = 3
 )
+
+type retryCategory string
+
+const (
+	retryCategoryTransient retryCategory = "transient"
+	retryCategorySecret    retryCategory = "secret"
+	retryCategoryPermanent retryCategory = "permanent"
+)
+
+type httpStatusError struct {
+	Service string
+	Status  int
+	Body    string
+}
+
+func (e *httpStatusError) Error() string {
+	if strings.TrimSpace(e.Body) == "" {
+		return fmt.Sprintf("%s returned status %d", e.Service, e.Status)
+	}
+	return fmt.Sprintf("%s returned status %d: %s", e.Service, e.Status, e.Body)
+}
 
 // LogPilotReconciler reconciles a LogPilot object
 type LogPilotReconciler struct {
@@ -106,7 +128,7 @@ func (r *LogPilotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			logger.Error(statusErr, "failed to update status for secret retrieval error")
 			return ctrl.Result{}, statusErr
 		}
-		return ctrl.Result{RequeueAfter: interval}, nil
+		return ctrl.Result{RequeueAfter: requeueAfterForCategory(interval, retryCategorySecret)}, nil
 	}
 
 	webhook, err := r.getSecretValue(ctx, req.Namespace, logPilot.Spec.WebhookSecret, logPilot.Spec.WebhookSecretKey)
@@ -116,7 +138,7 @@ func (r *LogPilotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			logger.Error(statusErr, "failed to update status for secret retrieval error")
 			return ctrl.Result{}, statusErr
 		}
-		return ctrl.Result{RequeueAfter: interval}, nil
+		return ctrl.Result{RequeueAfter: requeueAfterForCategory(interval, retryCategorySecret)}, nil
 	}
 	// Loki query window:
 	// - normal case: query from last successful check time to now
@@ -136,8 +158,12 @@ func (r *LogPilotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	startTime := start.UnixNano()
 	logger.Info("query window", "startTime", startTime, "endTime", endTime)
 
-	lokiURL := fmt.Sprintf("%s/loki/api/v1/query_range?query=%s&start=%d&end=%d", logPilot.Spec.LokiURL, url.QueryEscape(lokiQuery), startTime, endTime)
-	// fmt.Printf("lokiURL: %s\n", lokiURL)
+	queryParams := url.Values{}
+	queryParams.Set("query", lokiQuery)
+	queryParams.Set("start", strconv.FormatInt(startTime, 10))
+	queryParams.Set("end", strconv.FormatInt(endTime, 10))
+	queryParams.Set("limit", strconv.Itoa(maxLogEntries))
+	lokiURL := fmt.Sprintf("%s/loki/api/v1/query_range?%s", logPilot.Spec.LokiURL, queryParams.Encode())
 	lokiCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
@@ -154,7 +180,7 @@ func (r *LogPilotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			logger.Error(statusErr, "failed to update status for loki query error")
 			return ctrl.Result{}, statusErr
 		}
-		return ctrl.Result{RequeueAfter: interval}, nil
+		return ctrl.Result{RequeueAfter: requeueAfterForCategory(interval, classifyLokiRetry(err))}, nil
 	}
 
 	// If there are log results, call LLM for analysis
@@ -165,7 +191,7 @@ func (r *LogPilotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		errEntries := filterSeverities(enriched, "error", "critical")
 		patternsAll := detectPatterns(enriched)
 		if len(errEntries) == 0 {
-			if statusErr := r.updateStatusSuccess(ctx, &logPilot, "No error/critical logs found"); statusErr != nil {
+			if statusErr := r.updateStatusSuccess(ctx, &logPilot, "No error/critical logs found", end, ""); statusErr != nil {
 				logger.Error(statusErr, "failed to update status for no error/critical logs")
 				return ctrl.Result{}, statusErr
 			}
@@ -186,30 +212,32 @@ func (r *LogPilotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				logger.Error(statusErr, "failed to update status for llm analysis error")
 				return ctrl.Result{}, statusErr
 			}
-			return ctrl.Result{RequeueAfter: interval}, nil
+			return ctrl.Result{RequeueAfter: requeueAfterForCategory(interval, classifyLLMRetry(err))}, nil
 		}
 		if analysisResult != nil && strings.TrimSpace(analysisResult.Analysis) != "" {
 			analysisText = analysisText + "\n\nLLM reasoning:\n" + analysisResult.Analysis
 		}
 
 		hasError := shouldAlert(errEntries, patternsAll)
+		var deliveryErr string
 		// If the deterministic result indicates there is a problem with the logs, send Feishu alert
 		if hasError {
 			err := r.sendLarkAlert(ctx, webhook, analysisText)
 			if err != nil {
 				logger.Error(err, "Failed to send lark alert")
+				deliveryErr = fmt.Sprintf("Webhook delivery error: %v", err)
 			}
 		} else {
 			logger.Info("No issues found in logs according to deterministic analysis")
 		}
 		// Update status with analysis result
-		if statusErr := r.updateStatusSuccess(ctx, &logPilot, analysisText); statusErr != nil {
+		if statusErr := r.updateStatusSuccess(ctx, &logPilot, analysisText, end, deliveryErr); statusErr != nil {
 			logger.Error(statusErr, "failed to update status for successful analysis")
 			return ctrl.Result{}, statusErr
 		}
 		return ctrl.Result{RequeueAfter: interval}, nil
 	} else {
-		if statusErr := r.updateStatusSuccess(ctx, &logPilot, "No logs found"); statusErr != nil {
+		if statusErr := r.updateStatusSuccess(ctx, &logPilot, "No logs found", end, ""); statusErr != nil {
 			logger.Error(statusErr, "failed to update status for empty log result")
 			return ctrl.Result{}, statusErr
 		}
@@ -255,7 +283,8 @@ func (r *LogPilotReconciler) queryLoki(ctx context.Context, lokiURL string) ([]L
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("loki returned status %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		return nil, &httpStatusError{Service: "loki", Status: resp.StatusCode, Body: string(body)}
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -316,7 +345,7 @@ func (r *LogPilotReconciler) getSecretValue(ctx context.Context, namespace, name
 }
 
 const systemPrompt = `你是一名经验丰富的日志分析专家和系统优化顾问。以下输入是经过自动严重级别判断、聚类去重与根因模式检测后的JSON摘要。
-你的任务是：给出环境（根据namespace标签确定是哪个环境）,给出服务（根据app标签确定是哪个服务），基于摘要进行原因推断，给出关键结论和简短建议。不要重新判断严重级别。`
+你的任务是：给出环境（根据namespace标签确定是哪个环境）,基于摘要进行原因推断，给出关键结论和简短建议。不要重新判断严重级别。`
 
 // analyzeLogsWithLLM calls the LLM interface to analyze logs
 func (r *LogPilotReconciler) analyzeLogsWithLLM(ctx context.Context, spec logv1.LogPilotSpec, token, summary string) (*LLMAnalysisResult, error) {
@@ -452,13 +481,13 @@ func (r *LogPilotReconciler) updateStatusAttempt(ctx context.Context, logPilot *
 	})
 }
 
-func (r *LogPilotReconciler) updateStatusSuccess(ctx context.Context, logPilot *logv1.LogPilot, analysis string) error {
+func (r *LogPilotReconciler) updateStatusSuccess(ctx context.Context, logPilot *logv1.LogPilot, analysis string, queryEnd time.Time, statusErr string) error {
 	key := client.ObjectKeyFromObject(logPilot)
 	return r.updateStatusWithRetry(ctx, key, func(current *logv1.LogPilot) {
 		current.Status.LastAttemptTime = metav1.Now()
-		current.Status.LastSuccessTime = current.Status.LastAttemptTime
+		current.Status.LastSuccessTime = metav1.NewTime(queryEnd)
 		current.Status.LastAnalysis = analysis
-		current.Status.LastError = ""
+		current.Status.LastError = statusErr
 	})
 }
 
@@ -479,6 +508,84 @@ func (r *LogPilotReconciler) updateStatusWithRetry(ctx context.Context, key clie
 		mutate(&current)
 		return r.Status().Update(ctx, &current)
 	})
+}
+
+func classifyLokiRetry(err error) retryCategory {
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		switch {
+		case statusErr.Status == http.StatusTooManyRequests:
+			return retryCategoryTransient
+		case statusErr.Status >= 400 && statusErr.Status < 500:
+			return retryCategoryPermanent
+		default:
+			return retryCategoryTransient
+		}
+	}
+	return retryCategoryTransient
+}
+
+func classifyLLMRetry(err error) retryCategory {
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		switch {
+		case statusErr.Status == http.StatusTooManyRequests:
+			return retryCategoryTransient
+		case statusErr.Status >= 400 && statusErr.Status < 500:
+			return retryCategoryPermanent
+		default:
+			return retryCategoryTransient
+		}
+	}
+
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "unsupported llm provider"):
+		return retryCategoryPermanent
+	case strings.Contains(msg, "invalid api key"),
+		strings.Contains(msg, "incorrect api key"),
+		strings.Contains(msg, "authentication"),
+		strings.Contains(msg, "unauthorized"),
+		strings.Contains(msg, "permission denied"),
+		strings.Contains(msg, "model_not_found"),
+		strings.Contains(msg, "invalid_request_error"),
+		strings.Contains(msg, "status 400"),
+		strings.Contains(msg, "status 401"),
+		strings.Contains(msg, "status 403"),
+		strings.Contains(msg, "status 404"):
+		return retryCategoryPermanent
+	default:
+		return retryCategoryTransient
+	}
+}
+
+func requeueAfterForCategory(interval time.Duration, category retryCategory) time.Duration {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+
+	switch category {
+	case retryCategorySecret:
+		return maxDuration(interval*5, 5*time.Minute)
+	case retryCategoryPermanent:
+		return maxDuration(interval*10, 15*time.Minute)
+	default:
+		return minDuration(maxDuration(interval*2, 30*time.Second), 15*time.Minute)
+	}
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func parseLokiTime(ns string) (time.Time, error) {

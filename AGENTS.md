@@ -1,40 +1,19 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `cmd/` holds the entrypoint (`cmd/main.go`) for the controller manager.
-- `internal/` contains core controller logic (reconciler, tests, helpers).
-- `api/` defines the CRD API types (versioned). Generated code lands alongside.
-- `config/` contains Kustomize bases/overlays, RBAC, CRDs, and samples.
-- `test/` includes e2e tests and test utilities; unit/integration tests live under `internal/`.
-- `bin/` is the default output for built binaries; `dist/` holds generated install artifacts.
+`cmd/main.go` is the controller entrypoint. API definitions live in `api/v1/`; generated deepcopy code is committed alongside the types. Core reconciliation logic and controller tests live in `internal/controller/`. Kubernetes manifests, RBAC, CRDs, samples, and Kustomize overlays are under `config/`. End-to-end tests live in `test/e2e/`, with helpers in `test/utils/`. Built binaries go to `bin/`; generated install output goes to `dist/`.
 
 ## Build, Test, and Development Commands
-- `make build`: generate manifests/code, format, vet, then build `bin/manager`.
-- `make run`: run the controller locally against your kubeconfig.
-- `make test`: run controller tests with envtest; writes `cover.out`.
-- `make test-e2e`: run Ginkgo e2e tests in `test/e2e` (requires a running Kind cluster).
-- `make lint` / `make lint-fix`: run `golangci-lint` (optionally auto-fix).
-- `make docker-build` / `make docker-push IMG=...`: build and push the controller image.
-- `make build-installer IMG=...`: generate `dist/install.yaml` from `config/`.
-- `make help`: list all available targets.
+Use `make build` to generate code/manifests, format, vet, and build `bin/manager`. Use `make run` to run the controller against the current kubeconfig. Use `make test` for envtest-based Go tests and `make test-e2e` for Kind-backed end-to-end coverage. Use `make lint` or `make lint-fix` for `golangci-lint`. Container workflows use `make docker-build IMG=<registry>/logpilot:tag`, `make docker-push IMG=...`, and `make build-installer IMG=...`.
 
 ## Coding Style & Naming Conventions
-- Go formatting is enforced with `gofmt` (`make fmt`). Indentation is tabs per Go style.
-- Keep exported types and fields in `CamelCase`; unexported in `camelCase`.
-- Update CRD markers and run `make manifests` when API changes.
+This repo follows standard Go conventions: tabs via `gofmt`, exported identifiers in `CamelCase`, unexported identifiers in `camelCase`, and test files named `*_test.go`. Run `make fmt` and `make vet` before submitting changes. When updating CRD types or kubebuilder markers in `api/v1/`, regenerate artifacts with `make generate` and `make manifests`.
 
 ## Testing Guidelines
-- Tests use Ginkgo/Gomega (`internal/controller/*_test.go`, `test/e2e/*_test.go`).
-- Name tests with `*_test.go`; e2e specs live under `test/e2e`.
-- Run `make test` for envtest-based suites; `make test-e2e` for cluster integration.
+Unit and integration tests use Ginkgo/Gomega under `internal/controller/`; e2e specs use the same stack under `test/e2e/`. Prefer focused reconciliation tests for controller behavior and reserve `test/e2e` for cluster integration paths. Run `make test` locally for normal validation; run `make test-e2e` only when a `kind` cluster is already running.
 
 ## Commit & Pull Request Guidelines
-- Commit messages follow conventional prefixes seen in history: `feat:`, `fix:`, `update:`.
-- PRs should include:
-  - A short summary and rationale.
-  - Test evidence (commands run, e.g. `make test`).
-  - Updated generated files when APIs or manifests change (`make generate`, `make manifests`).
+Recent history uses conventional prefixes such as `feat:`, `fix:`, and `update:`. Keep commit subjects short and imperative, for example `fix: handle missing webhook secret`. Pull requests should include a brief summary, the reason for the change, and test evidence such as `make test` or `make test-e2e`. If APIs or manifests changed, include regenerated files in the same PR.
 
 ## Configuration & Deployment Notes
-- Sample CRs live in `config/samples/`. Apply with `kubectl apply -k config/samples/`.
-- Deploy to a cluster with `make install` (CRDs) and `make deploy IMG=...`.
+Sample custom resources live in `config/samples/`; apply them with `kubectl apply -f config/samples/log_v1_logpilot.yaml`. Install CRDs with `make install` and deploy the controller with `make deploy IMG=<registry>/logpilot:tag`. The default container tool is `nerdctl`, but `CONTAINER_TOOL` can be overridden if needed.

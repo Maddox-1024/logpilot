@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -179,7 +181,13 @@ var _ = Describe("LogPilot Controller", func() {
 		}
 	})
 
+	var createResourceWithMutate func(string, string, func(*logv1.LogPilotSpec))
+
 	createResource := func(lokiURL string, interval string) {
+		createResourceWithMutate(lokiURL, interval, nil)
+	}
+
+	createResourceWithMutate = func(lokiURL string, interval string, mutate func(*logv1.LogPilotSpec)) {
 		resource = &logv1.LogPilot{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "sample",
@@ -197,6 +205,9 @@ var _ = Describe("LogPilot Controller", func() {
 				WebhookSecretKey:   webhookSecretKey,
 			},
 		}
+		if mutate != nil {
+			mutate(&resource.Spec)
+		}
 		Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 	}
 
@@ -206,7 +217,7 @@ var _ = Describe("LogPilot Controller", func() {
 		result := reconcileOnce()
 		current := fetchLogPilot()
 
-		Expect(result.RequeueAfter).To(Equal(2 * time.Minute))
+		Expect(result.RequeueAfter).To(Equal(10 * time.Minute))
 		Expect(current.Status.LastError).To(ContainSubstring("Secret error"))
 		Expect(current.Status.LastAttemptTime.IsZero()).To(BeFalse())
 		Expect(current.Status.LastSuccessTime.IsZero()).To(BeTrue())
@@ -217,10 +228,17 @@ var _ = Describe("LogPilot Controller", func() {
 		createSecret(ctx, namespace, llmSecretName, llmSecretKey, "test-token")
 		createSecret(ctx, namespace, webhookSecretName, webhookSecretKey, "https://example.invalid/lark")
 
+		var queryEnd int64
+		var queryLimit string
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			Expect(r.URL.Path).To(Equal("/loki/api/v1/query_range"))
+			values, err := url.ParseQuery(r.URL.RawQuery)
+			Expect(err).NotTo(HaveOccurred())
+			queryEnd, err = strconv.ParseInt(values.Get("end"), 10, 64)
+			Expect(err).NotTo(HaveOccurred())
+			queryLimit = values.Get("limit")
 			w.Header().Set("Content-Type", "application/json")
-			_, err := w.Write([]byte(newLokiResponse()))
+			_, err = w.Write([]byte(newLokiResponse()))
 			Expect(err).NotTo(HaveOccurred())
 		}))
 		defer server.Close()
@@ -235,6 +253,9 @@ var _ = Describe("LogPilot Controller", func() {
 		Expect(current.Status.LastAnalysis).To(Equal("No logs found"))
 		Expect(current.Status.LastAttemptTime.IsZero()).To(BeFalse())
 		Expect(current.Status.LastSuccessTime.IsZero()).To(BeFalse())
+		Expect(current.Status.LastSuccessTime.Time.UnixNano()).To(Equal(queryEnd))
+		Expect(queryLimit).To(Equal(strconv.Itoa(maxLogEntries)))
+		Expect(current.Status.LastAttemptTime.Time.After(current.Status.LastSuccessTime.Time) || current.Status.LastAttemptTime.Equal(&current.Status.LastSuccessTime)).To(BeTrue())
 	})
 
 	It("records a success status when only non-error logs are returned", func() {
@@ -276,7 +297,7 @@ var _ = Describe("LogPilot Controller", func() {
 		result := reconcileOnce()
 		current := fetchLogPilot()
 
-		Expect(result.RequeueAfter).To(Equal(75 * time.Second))
+		Expect(result.RequeueAfter).To(Equal(150 * time.Second))
 		Expect(current.Status.LastError).To(ContainSubstring("Loki error"))
 		Expect(current.Status.LastError).To(ContainSubstring("status 500"))
 		Expect(current.Status.LastAttemptTime.IsZero()).To(BeFalse())
@@ -302,5 +323,46 @@ var _ = Describe("LogPilot Controller", func() {
 		Expect(result.RequeueAfter).To(Equal(time.Minute))
 		Expect(current.Status.LastError).To(BeEmpty())
 		Expect(current.Status.LastAnalysis).To(Equal("No logs found"))
+	})
+
+	It("preserves webhook delivery failures in status without dropping analysis", func() {
+		createSecret(ctx, namespace, llmSecretName, llmSecretKey, "test-token")
+
+		webhookServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "delivery failed", http.StatusInternalServerError)
+		}))
+		defer webhookServer.Close()
+		createSecret(ctx, namespace, webhookSecretName, webhookSecretKey, webhookServer.URL)
+
+		llmServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			Expect(r.URL.Path).To(Equal("/chat/completions"))
+			w.Header().Set("Content-Type", "application/json")
+			_, err := w.Write([]byte(`{"choices":[{"message":{"content":"Root cause summary"}}]}`))
+			Expect(err).NotTo(HaveOccurred())
+		}))
+		defer llmServer.Close()
+
+		lokiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, err := w.Write([]byte(newLokiResponse(
+				`ERROR database connection refused`,
+			)))
+			Expect(err).NotTo(HaveOccurred())
+		}))
+		defer lokiServer.Close()
+
+		createResourceWithMutate(lokiServer.URL, "1m", func(spec *logv1.LogPilotSpec) {
+			spec.OpenAI = &logv1.OpenAIConfig{BaseURL: llmServer.URL}
+		})
+
+		result := reconcileOnce()
+		current := fetchLogPilot()
+
+		Expect(result.RequeueAfter).To(Equal(time.Minute))
+		Expect(current.Status.LastSuccessTime.IsZero()).To(BeFalse())
+		Expect(current.Status.LastAnalysis).To(ContainSubstring("Deterministic summary:"))
+		Expect(current.Status.LastAnalysis).To(ContainSubstring("LLM reasoning:\nRoot cause summary"))
+		Expect(current.Status.LastError).To(ContainSubstring("Webhook delivery error"))
+		Expect(current.Status.LastError).To(ContainSubstring("status=500"))
 	})
 })
