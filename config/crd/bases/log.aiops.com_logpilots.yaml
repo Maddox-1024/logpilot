@@ -43,11 +43,9 @@ spec:
                 description: Gemini Config
                 type: object
               interval:
+                default: 1m
                 description: Interval
-                pattern: ^(\\d+(ns|us|ms|s|m|h))+$
-                type: string
-              larkWebhook:
-                description: Feishu Webhook
+                pattern: ^([0-9]+(ns|us|ms|s|m|h))+$
                 type: string
               llmAPIKeySecret:
                 description: LLM API Key Secret
@@ -80,14 +78,21 @@ spec:
                     description: Base URL for the OpenAI API
                     type: string
                 type: object
+              webhookSecret:
+                description: Webhook Secret
+                type: string
+              webhookSecretKey:
+                type: string
             required:
-            - larkWebhook
+            - interval
             - llmAPIKeySecret
             - llmAPIKeySecretKey
             - llmModel
             - llmProvider
             - logQL
             - lokiURL
+            - webhookSecret
+            - webhookSecretKey
             type: object
           status:
             description: LogPilotStatus defines the observed state of LogPilot.

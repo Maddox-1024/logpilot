@@ -1,2 +1,17 @@
-
-
+apiVersion: log.aiops.com/v1
+kind: LogPilot
+metadata:
+  name: sample-logpilot
+  namespace: default
+spec:
+  lokiURL: http://loki-gateway.monitoring.svc.cluster.local
+  logQL: '{namespace="default"} |= "error"'
+  interval: 1m
+  llmProvider: OpenAI
+  llmModel: gpt-4o-mini
+  llmAPIKeySecret: logpilot-llm
+  llmAPIKeySecretKey: api-key
+  webhookSecret: logpilot-webhook
+  webhookSecretKey: url
+  openAI:
+    baseURL: https://api.openai.com/v1

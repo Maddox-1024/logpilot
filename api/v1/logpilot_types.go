@@ -48,8 +48,8 @@ type LogPilotSpec struct {
 	// +kubebuilder:validation:Required
 	LogQL string `json:"logQL"`
 	// Interval
-	// +kubebuilder:validation:Pattern=`^(\\d+(ns|us|ms|s|m|h))+$`
-	// +kubebuilder:validation:Default="1m"
+	// +kubebuilder:validation:Pattern=`^([0-9]+(ns|us|ms|s|m|h))+$`
+	// +kubebuilder:default:="1m"
 	Interval string `json:"interval"`
 	// Model Provider
 	// +kubebuilder:validation:Required
@@ -70,7 +70,7 @@ type LogPilotSpec struct {
 	Gemini *GeminiConfig `json:"gemini,omitempty"`
 	// Webhook Secret
 	// +kubebuilder:validation:Required
-	WebhookSecret string `json:"WebhookSecret"`
+	WebhookSecret string `json:"webhookSecret"`
 	// +kubebuilder:validation:Required
 	WebhookSecretKey string `json:"webhookSecretKey"`
 }
