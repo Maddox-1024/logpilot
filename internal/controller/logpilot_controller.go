@@ -58,7 +58,7 @@ type LogPilotReconciler struct {
 	HTTPClient *http.Client
 }
 
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups=log.aiops.com,resources=logpilots,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=log.aiops.com,resources=logpilots/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=log.aiops.com,resources=logpilots/finalizers,verbs=update
@@ -102,6 +102,16 @@ func (r *LogPilotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	apiKey, err := r.getSecretValue(ctx, req.Namespace, logPilot.Spec.LLMAPIKeySecret, logPilot.Spec.LLMAPIKeySecretKey)
 	if err != nil {
 		logger.Error(err, "unable to get LLM API key from secret")
+		if statusErr := r.updateStatusError(ctx, &logPilot, fmt.Sprintf("Secret error: %v", err)); statusErr != nil {
+			logger.Error(statusErr, "failed to update status for secret retrieval error")
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: interval}, nil
+	}
+
+	webhook, err := r.getSecretValue(ctx, req.Namespace, logPilot.Spec.WebhookSecret, logPilot.Spec.WebhookSecretKey)
+	if err != nil {
+		logger.Error(err, "unable to get webhook URL from secret")
 		if statusErr := r.updateStatusError(ctx, &logPilot, fmt.Sprintf("Secret error: %v", err)); statusErr != nil {
 			logger.Error(statusErr, "failed to update status for secret retrieval error")
 			return ctrl.Result{}, statusErr
@@ -185,7 +195,7 @@ func (r *LogPilotReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		hasError := shouldAlert(errEntries, patternsAll)
 		// If the deterministic result indicates there is a problem with the logs, send Feishu alert
 		if hasError {
-			err := r.sendLarkAlert(ctx, logPilot.Spec.LarkWebhook, analysisText)
+			err := r.sendLarkAlert(ctx, webhook, analysisText)
 			if err != nil {
 				logger.Error(err, "Failed to send lark alert")
 			}
@@ -306,7 +316,7 @@ func (r *LogPilotReconciler) getSecretValue(ctx context.Context, namespace, name
 }
 
 const systemPrompt = `你是一名经验丰富的日志分析专家和系统优化顾问。以下输入是经过自动严重级别判断、聚类去重与根因模式检测后的JSON摘要。
-你的任务是：给出环境（根据namespace标签确定是哪个环境）,给出服务（根据app标签确定是哪个服务），基于摘要进行原因推断，给出关键结论和简短建议。不要重新判断严重级别，也不要输出[lark]。`
+你的任务是：给出环境（根据namespace标签确定是哪个环境）,给出服务（根据app标签确定是哪个服务），基于摘要进行原因推断，给出关键结论和简短建议。不要重新判断严重级别。`
 
 // analyzeLogsWithLLM calls the LLM interface to analyze logs
 func (r *LogPilotReconciler) analyzeLogsWithLLM(ctx context.Context, spec logv1.LogPilotSpec, token, summary string) (*LLMAnalysisResult, error) {

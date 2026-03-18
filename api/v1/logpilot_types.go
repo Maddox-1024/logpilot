@@ -49,7 +49,8 @@ type LogPilotSpec struct {
 	LogQL string `json:"logQL"`
 	// Interval
 	// +kubebuilder:validation:Pattern=`^(\\d+(ns|us|ms|s|m|h))+$`
-	Interval string `json:"interval,omitempty"`
+	// +kubebuilder:validation:Default="1m"
+	Interval string `json:"interval"`
 	// Model Provider
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:Enum=OpenAI;Gemini
@@ -67,9 +68,11 @@ type LogPilotSpec struct {
 	OpenAI *OpenAIConfig `json:"openAI,omitempty"`
 	// Gemini Config
 	Gemini *GeminiConfig `json:"gemini,omitempty"`
-	// Feishu Webhook
+	// Webhook Secret
 	// +kubebuilder:validation:Required
-	LarkWebhook string `json:"larkWebhook"`
+	WebhookSecret string `json:"WebhookSecret"`
+	// +kubebuilder:validation:Required
+	WebhookSecretKey string `json:"webhookSecretKey"`
 }
 
 // LogPilotStatus defines the observed state of LogPilot.
